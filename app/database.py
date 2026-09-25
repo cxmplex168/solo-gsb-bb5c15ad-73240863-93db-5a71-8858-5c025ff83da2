@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -457,23 +458,70 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch the database to WAL, tolerating processes starting together.
+
+    Changing the journal mode briefly takes an exclusive lock and -- unlike
+    ordinary statements -- does not honour ``busy_timeout``, so two service
+    processes opening a fresh database file at the same instant can see a
+    spurious ``database is locked`` here.  Retry briefly: once any process
+    has made the switch the pragma is a cheap no-op for everyone else.
+    """
+    for attempt in range(100):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == 99:
+                raise
+            time.sleep(0.1)
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    _enable_wal(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
+def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute every statement of ``script`` inside the current transaction.
+
+    ``Connection.executescript`` cannot be used for the bootstrap: it issues
+    an implicit ``COMMIT`` for any pending transaction first, which would
+    break the all-or-nothing guarantee of :func:`init_db`.  Statements are
+    split with :func:`sqlite3.complete_statement` and run one by one.
+    """
+    statement = ""
+    for line in script.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            sql = statement.strip()
+            if sql:
+                conn.execute(sql)
+            statement = ""
+    sql = statement.strip()
+    if sql:
+        conn.execute(sql)
+
+
 def init_db(db_path: str) -> None:
     """Create the database directory, base schema and pending migrations.
 
-    Safe to call repeatedly: the v0 schema is created idempotently and each
-    numbered migration runs at most once (recorded in ``schema_migrations``).
-    An existing database from an earlier release therefore upgrades in place
-    without losing any data.
+    The whole bootstrap runs in one ``BEGIN IMMEDIATE`` transaction: the
+    write lock is taken *before* the migration ledger is read, so two
+    service processes started against the same database file serialise here
+    and the loser simply sees every version already applied instead of
+    running the same migrations a second time.  Base schema, per-version
+    migrations and the version registrations commit or roll back together,
+    so a failure midway leaves neither half-created structures nor a wrong
+    version record; the next start re-runs exactly the versions that never
+    committed.  Safe to call repeatedly: committed versions are recorded in
+    ``schema_migrations`` and never run again, so an existing database from
+    an earlier release upgrades in place without losing any data.
     """
     from .time_utils import store_event_time
 
@@ -481,29 +529,30 @@ def init_db(db_path: str) -> None:
     os.makedirs(parent, exist_ok=True)
     conn = connect(db_path)
     try:
-        # Bootstrap the complete base schema (no-ops on existing databases).
-        conn.executescript(SCHEMA_V0)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        applied = {
-            r["version"]
-            for r in conn.execute("SELECT version FROM schema_migrations")
-        }
-        for version in sorted(MIGRATIONS):
-            if version in applied:
-                continue
-            # Each migration is one serialised unit: its DDL and the ledger
-            # insert commit together, so a crash before completion leaves the
-            # version unrecorded and the (idempotent) migration re-runnable.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Bootstrap the complete base schema and the ledger table inside
+            # the same transaction (no-ops on existing databases).
+            _execute_script(conn, SCHEMA_V0)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            applied = {
+                r["version"]
+                for r in conn.execute("SELECT version FROM schema_migrations")
+            }
+            for version in sorted(MIGRATIONS):
+                if version in applied:
+                    continue
+                # Each migration's DDL and its ledger insert commit together
+                # with everything else, so a crash before completion leaves
+                # the version unrecorded and the migration re-runnable.
                 MIGRATIONS[version](conn, store_event_time(utc_now()))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
 
