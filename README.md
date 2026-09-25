@@ -74,7 +74,9 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
-  告警状态、来源封存与尾流发布均在同一把写锁/同一事务内推进，消除上报与封存的并发竞态
+  告警状态、来源封存与尾流发布均在同一把写锁/同一事务内推进，消除上报与封存的并发竞态；
+  启动建库与版本迁移同样**先取写锁再读迁移记录**，两个服务进程共用同一数据库文件
+  同时启动也能安全完成初始化（见“数据库迁移”）
 
 ## 单条命令启动
 
@@ -108,7 +110,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 438 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 441 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -1052,9 +1054,20 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
 基础表（`CREATE TABLE IF NOT EXISTS`），并按 `schema_migrations` 表记录的版本号依次执行
-尚未应用的迁移；每个迁移与其版本登记在同一个 `BEGIN IMMEDIATE` 事务内提交。
-因此老版本数据库会在下次启动时**原地升级、不丢数据**，新数据库则直接建到最新版本，
-无需手工初始化。当前迁移版本：
+尚未应用的迁移。整个引导过程**先取得写锁、再读取迁移记录**：基础建表与每个版本迁移
+（连同其版本登记）都在各自的 `BEGIN IMMEDIATE` 可回滚事务内逐条执行——不使用
+`executescript`（它会隐式提交，中途失败会留下半套表结构）。因此：
+
+- **多进程同时启动安全**：两个服务进程共用同一 SQLite 文件同时启动时，先到者持写锁
+  完成初始化，后到者在写锁上等待（`busy_timeout` 30s；WAL 模式切换本身不在 busy
+  回调路径上，连接层会自行重试等待其就绪），随后在锁内重新读取迁移记录——
+  **每个版本全局只执行一次**，不会重复建表或重复登记。
+- **失败可恢复**：任一版本中途失败，该版本整体回滚——不留半套结构、也不登记版本号；
+  已成功登记的版本不受影响，修复后重启从失败版本继续升级。
+- **原地升级不丢数据**：老版本数据库在下次启动时原地升级，既有会话、读数与检查点
+  原值保留；新数据库直接建到最新版本，无需手工初始化。
+
+当前迁移版本：
 
 - **v1**：跨来源复合告警的三张表（`correlated_rules` / `correlated_conditions` /
   `correlated_events`）。
@@ -1162,7 +1175,8 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
 │   └── test_exposure.py   # 阈值暴露时长：持有语义/起点继承/同刻 seq/未知区间/value_key/只看已发布/400/只读/单快照测试（47 个）
 │   └── test_local_spikes.py # 局部尖峰：中位数/MAD/严格判定/MAD 为零/邻居窗口与下限/闭区间/value_key/200 上限/400/只读/单快照/偶数项中位数与 MAD 防溢出（1e308）测试（60 个）
-│   └── test_nonfinite_integers.py # 无法表示为有限浮点的整数（10**400）：正常保存/发布/判重、单来源打断连续计数、跨来源不计命中且窗口照常过期、两类规则晚建回放、尾流封存、exposure/local-spikes 边界测试（16 个）
+│   ├── test_nonfinite_integers.py # 无法表示为有限浮点的整数（10**400）：正常保存/发布/判重、单来源打断连续计数、跨来源不计命中且窗口照常过期、两类规则晚建回放、尾流封存、exposure/local-spikes 边界测试（16 个）
+│   └── test_database_init.py # 启动建库与迁移：双进程同时初始化每版本只执行一次、失败整体回滚不留半套结构、修复后重启续升（3 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
